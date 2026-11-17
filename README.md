@@ -54,45 +54,46 @@ flowchart TD
 
 ### 1. Broadcasting Gradient Reduction (`unbroadcast`)
 
-When a forward binary operation $C = f(A, B)$ broadcasts an input tensor $A \in \mathbb{R}^{s_1 \times \dots \times s_k}$ to an output shape $S_{\text{out}} = (d_1, \dots, d_m)$ with $m \ge k$, NumPy implicitly:
-1. Prepends $m - k$ singleton dimensions of size $1$ on the left of $A$'s shape: $\tilde{S}_A = (\underbrace{1, \dots, 1}_{m-k}, s_1, \dots, s_k)$.
-2. Replicates $A$ along every axis $j \in \{1, \dots, m\}$ where $\tilde{s}_j = 1$ and $d_j > 1$.
+When a forward binary operation $C = f(A, B)$ broadcasts an input tensor $A \in \mathbb{R}^{s_1 \times \dots \times s_k}$ to an output shape $S_{\mathrm{out}} = (d_1, \dots, d_m)$ with $m \ge k$, NumPy implicitly:
+1. Prepends $m - k$ singleton dimensions of size $1$ on the left of $A$'s shape:
+   $$\tilde{S}_A = (\underbrace{1, \dots, 1}_{m-k}, s_1, \dots, s_k)$$
+2. Replicates $A$ along every axis $j \in [1, m]$ where $\tilde{s}_j = 1$ and $d_j \gt 1$.
 
-By the multivariate chain rule, a single scalar entry of $A$ contributes additively to all replicated positions along the broadcasted axes in $C$. Therefore, given upstream gradient $G = \frac{\partial \mathcal{L}}{\partial C} \in \mathbb{R}^{d_1 \times \dots \times d_m}$, `unbroadcast(G, A.shape)` computes the exact pullback:
+By the multivariate chain rule, a single scalar entry of $A$ contributes additively to all replicated positions along the broadcasted axes in $C$. Therefore, given upstream gradient $G = \frac{\partial L}{\partial C} \in \mathbb{R}^{d_1 \times \dots \times d_m}$, `unbroadcast(G, A.shape)` computes the exact pullback:
 
-$$\frac{\partial \mathcal{L}}{\partial A} = \operatorname{reshape}_{S_A}\!\left(\sum_{j \in \mathcal{J}_{\text{sing}}} \sum_{i=1}^{m-k} G\right), \quad \mathcal{J}_{\text{sing}} = \left\{\, j \in \{m-k+1, \dots, m\} \;\middle|\; \tilde{s}_j = 1 \text{ and } d_j > 1 \,\right\}$$
+$$\frac{\partial L}{\partial A} = \mathrm{reshape}_{S_A}\left(\sum_{j \in J_{\mathrm{sing}}} \sum_{i=1}^{m-k} G\right), \quad J_{\mathrm{sing}} = \left[\, j \in [m-k+1, m] : \tilde{s}_j = 1 \text{ and } d_j \gt 1 \,\right]$$
 
 ### 2. Stabilized Log-Sum-Exp (`log_softmax`) & Fused `cross_entropy_loss`
 
-Evaluating $\log\operatorname{softmax}(x)_i = \log\left(\frac{e^{x_i}}{\sum_j e^{x_j}}\right)$ naively overflows to $\log(\infty / \infty) = \text{NaN}$ in `float64` whenever $\max_j x_j > 709.78$ (and in `float32` whenever $\max_j x_j > 88.72$). Shifting by $c = \max_j x_j$ yields the exact identity:
+Evaluating $\log(\mathrm{softmax}(x)_i) = \log\left(\frac{e^{x_i}}{\sum_j e^{x_j}}\right)$ naively overflows to $\log(\infty / \infty) = \mathrm{NaN}$ in `float64` whenever $\max_j x_j \gt 709.78$ (and in `float32` whenever $\max_j x_j \gt 88.72$). Shifting by $c = \max_j x_j$ yields the exact identity:
 
-$$\operatorname{log\_softmax}(x)_i = (x_i - c) - \log\!\left(\sum_{j=1}^{K} \exp(x_j - c)\right), \quad c = \max_{1 \le j \le K} x_j$$
+$$\mathrm{logsoftmax}(x)_i = (x_i - c) - \log\left(\sum_{j=1}^{K} \exp(x_j - c)\right), \quad c = \max_{1 \le j \le K} x_j$$
 
 Since $x_j - c \le 0$ for all $j$ and equals $0$ for at least one index $j^*$, every exponential satisfies $\exp(x_j - c) \in [0, 1]$ and the sum is bounded in $[1, K]$, completely eliminating overflow and denominator underflow.
 
 **Analytical Backward Pass (Jacobian-Vector Product):**
-With $p_i = \operatorname{softmax}(x)_i = \frac{\exp(x_i - c)}{\sum_j \exp(x_j - c)}$ and upstream gradient $g_i = \frac{\partial \mathcal{L}}{\partial y_i}$:
+With $p_i = \mathrm{softmax}(x)_i = \frac{\exp(x_i - c)}{\sum_j \exp(x_j - c)}$ and upstream gradient $g_i = \frac{\partial L}{\partial y_i}$:
 
-$$\frac{\partial y_k}{\partial x_i} = \delta_{ik} - p_i \implies \frac{\partial \mathcal{L}}{\partial x_i} = \sum_{k=1}^{K} g_k (\delta_{ik} - p_i) = g_i - p_i \sum_{k=1}^{K} g_k$$
+$$\frac{\partial y_k}{\partial x_i} = \delta_{ik} - p_i \implies \frac{\partial L}{\partial x_i} = \sum_{k=1}^{K} g_k (\delta_{ik} - p_i) = g_i - p_i \sum_{k=1}^{K} g_k$$
 
 For fused **Cross-Entropy Loss** with smoothed target distribution $\tilde{y}_i = (1 - \epsilon) y_i + \frac{\epsilon}{K}$ over $N$ examples, substituting $g_k = -\frac{1}{N}\tilde{y}_k$ and $\sum_{k=1}^{K} \tilde{y}_k = 1$ gives the exact, cancellation-free analytical gradient:
 
-$$\frac{\partial \mathcal{L}_{\text{CE}}}{\partial x_i} = \frac{1}{N}\left(p_i - \tilde{y}_i\right)$$
+$$\frac{\partial L_{\mathrm{CE}}}{\partial x_i} = \frac{1}{N}\left(p_i - \tilde{y}_i\right)$$
 
 ### 3. Two-Pass Compensated `LayerNorm` & Analytical Backward Projection
 
-Naive one-pass variance $\operatorname{Var}(x) = \mathbb{E}[x^2] - (\mathbb{E}[x])^2$ suffers catastrophic cancellation when $\mathbb{E}[x]^2 \gg \operatorname{Var}(x)$ (for instance, in `float32` with offset $10^7$, $\mathbb{E}[x^2] - (\mathbb{E}[x])^2$ evaluates to $-8388608.0 < 0$, causing $\sqrt{\operatorname{Var}(x) + \epsilon} = \text{NaN}$).
+Naive one-pass variance $\mathrm{Var}(x) = \mathbb{E}[x^2] - (\mathbb{E}[x])^2$ suffers catastrophic cancellation when $(\mathbb{E}[x])^2 \gg \mathrm{Var}(x)$ (for instance, in `float32` with offset $10^7$, $\mathbb{E}[x^2] - (\mathbb{E}[x])^2$ evaluates to $-8388608.0 \lt 0$, causing $\sqrt{\mathrm{Var}(x) + \epsilon} = \mathrm{NaN}$).
 
 `tensor-forge` accumulates in `float64` using a two-pass centered formulation over feature dimension $D$:
 
 $$\mu = \frac{1}{D}\sum_{i=1}^{D} x_i, \qquad \sigma^2 = \frac{1}{D}\sum_{i=1}^{D} (x_i - \mu)^2, \qquad r = (\sigma^2 + \epsilon)^{-1/2}, \qquad \hat{x}_i = (x_i - \mu) r, \qquad y_i = \gamma_i \hat{x}_i + \beta_i$$
 
 **Analytical Backward Pass:**
-Given upstream gradient $dy_i = \frac{\partial \mathcal{L}}{\partial y_i}$ and $d\hat{x}_i = dy_i \gamma_i$:
+Given upstream gradient $dy_i = \frac{\partial L}{\partial y_i}$ and $d\hat{x}_i = dy_i \gamma_i$:
 
-$$\frac{\partial \mathcal{L}}{\partial \beta} = \sum_{\text{batch}} dy, \qquad \frac{\partial \mathcal{L}}{\partial \gamma} = \sum_{\text{batch}} dy \odot \hat{x}$$
+$$\frac{\partial L}{\partial \beta} = \sum_{\mathrm{batch}} dy, \qquad \frac{\partial L}{\partial \gamma} = \sum_{\mathrm{batch}} dy \odot \hat{x}$$
 
-$$\frac{\partial \mathcal{L}}{\partial x_i} = \frac{r}{D}\left(D\, d\hat{x}_i - \sum_{j=1}^{D} d\hat{x}_j - \hat{x}_i \sum_{j=1}^{D} d\hat{x}_j \hat{x}_j\right)$$
+$$\frac{\partial L}{\partial x_i} = \frac{r}{D}\left(D\, d\hat{x}_i - \sum_{j=1}^{D} d\hat{x}_j - \hat{x}_i \sum_{j=1}^{D} d\hat{x}_j \hat{x}_j\right)$$
 
 ---
 
